@@ -1,5 +1,116 @@
 import h5py
 import numpy as np
+import os
+
+
+def list_matlab_variables(filename):
+    """
+    List all variables and their datatypes from a MATLAB v7.3 .mat file.
+    
+    Parameters:
+    -----------
+    filename : str
+        Path to the .mat file (must be v7.3 format)
+    
+    Returns:
+    --------
+    dict
+        Dictionary with variable names as keys and their MATLAB datatypes as values
+        Example: {'varName1': 'double', 'varName2': 'timeseries', 'varName3': 'char'}
+    
+    Example:
+    --------
+    >>> variables = list_matlab_variables('data.mat')
+    >>> for var_name, var_type in variables.items():
+    >>>     print(f"{var_name}: {var_type}")
+    """
+    # Check if file exists
+    if not os.path.exists(filename):
+        abs_path = os.path.abspath(filename)
+        raise FileNotFoundError(f"File not found: {filename}\nAbsolute path attempted: {abs_path}")
+    
+    variables = {}
+    
+    try:
+        with h5py.File(filename, 'r') as f:
+            # Iterate through all items in the root group
+            for key in f.keys():
+                # Skip internal HDF5 groups
+                if key.startswith('#'):
+                    continue
+                
+                item = f[key]
+                
+                # Determine the datatype
+                if isinstance(item, h5py.Group):
+                    # It's a group (likely a struct)
+                    matlab_class = item.attrs.get('MATLAB_class', b'struct').decode('utf-8')
+                    variables[key] = matlab_class
+                elif isinstance(item, h5py.Dataset):
+                    # It's a dataset
+                    matlab_class = item.attrs.get('MATLAB_class', b'unknown').decode('utf-8')
+                    
+                    # Add shape information for arrays
+                    if matlab_class in ['double', 'single', 'int8', 'int16', 'int32', 'int64', 
+                                       'uint8', 'uint16', 'uint32', 'uint64', 'logical']:
+                        shape = item.shape
+                        if len(shape) == 1:
+                            variables[key] = f"{matlab_class} (1D array, length {shape[0]})"
+                        elif len(shape) == 2:
+                            variables[key] = f"{matlab_class} ({shape[1]}×{shape[0]})"  # Transposed for MATLAB convention
+                        else:
+                            # nD array
+                            shape_str = '×'.join(str(s) for s in reversed(shape))  # Reverse for MATLAB convention
+                            variables[key] = f"{matlab_class} ({shape_str})"
+                    else:
+                        variables[key] = matlab_class
+    
+    except OSError as e:
+        abs_path = os.path.abspath(filename)
+        raise OSError(f"Unable to open file '{filename}' (tried: {abs_path}).\n"
+                     f"Ensure the file is in MATLAB v7.3 format.\n"
+                     f"Original error: {str(e)}")
+    
+    return variables
+
+
+def print_matlab_variables(filename):
+    """
+    Print all variables and their datatypes from a MATLAB v7.3 .mat file.
+    
+    Parameters:
+    -----------
+    filename : str
+        Path to the .mat file (must be v7.3 format)
+    
+    Example:
+    --------
+    >>> print_matlab_variables('data.mat')
+    Variables in 'data.mat':
+    -------------------------
+    varName1: double (50×20)
+    varName2: timeseries
+    varName3: char
+    """
+    variables = list_matlab_variables(filename)
+    
+    print(f"\nVariables in '{filename}':")
+    print("-" * 50)
+    
+    if not variables:
+        print("No variables found.")
+        return
+    
+    # Find longest variable name for alignment
+    max_name_len = max(len(name) for name in variables.keys())
+    
+    # Print sorted by variable name
+    for var_name in sorted(variables.keys()):
+        var_type = variables[var_name]
+        print(f"{var_name:<{max_name_len}} : {var_type}")
+    
+    print(f"\nTotal: {len(variables)} variable(s)")
+
 
 def read_matlab_variable(filename, var_name):
     """
