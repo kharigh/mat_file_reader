@@ -1,10 +1,11 @@
 # MATLAB Variable Reader for v7.3 Files
 
-A Python function to read any MATLAB variable from v7.3 format `.mat` files using `h5py`.
+Python functions to read and list MATLAB variables from v7.3 format `.mat` files using `h5py`.
 
 ## Features
 
 ✅ **Universal reader** - Automatically detects and handles all common MATLAB data types  
+✅ **Variable listing** - List all variables in a .mat file with their types and dimensions  
 ✅ **Timeseries objects** - Extracts time and data vectors  
 ✅ **Numeric arrays** - Supports 1D, 2D, 3D, and nD arrays with correct dimensions  
 ✅ **Strings/chars** - Decodes MATLAB character arrays  
@@ -19,6 +20,37 @@ pip install h5py numpy
 ```
 
 ## Usage
+
+### List all variables in a .mat file
+
+```python
+from read_matlab_variable import list_matlab_variables, print_matlab_variables
+
+# Get dictionary of all variables
+variables = list_matlab_variables("yourfile.mat")
+for var_name, var_type in variables.items():
+    print(f"{var_name}: {var_type}")
+
+# Or use the pretty-print version
+print_matlab_variables("yourfile.mat")
+```
+
+Output:
+```
+Variables in 'yourfile.mat':
+--------------------------------------------------
+arr1D         : double (1×1000)
+arr2D         : double (50×20)
+arr3D         : double (10×20×30)
+file_name     : char
+myStruct      : struct
+tsSig         : timeseries
+varLenSignals : cell
+
+Total: 7 variable(s)
+```
+
+### Read a specific variable
 
 ```python
 from read_matlab_variable import read_matlab_variable
@@ -38,6 +70,20 @@ data = read_matlab_variable("yourfile.mat", "variable_name")
 | **Structures** | `dict` | Nested structures supported |
 
 ## Examples
+
+### Listing variables before reading
+
+```python
+from read_matlab_variable import list_matlab_variables, read_matlab_variable
+
+# First, see what's available
+variables = list_matlab_variables("data.mat")
+print(f"Found {len(variables)} variables: {list(variables.keys())}")
+
+# Then read what you need
+if 'myArray' in variables:
+    data = read_matlab_variable("data.mat", "myArray")
+```
 
 ### Reading different variable types
 
