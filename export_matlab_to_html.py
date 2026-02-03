@@ -48,7 +48,7 @@ def export_matlab_to_html(mat_filename, output_html=None, max_display_rows=100):
             data = read_matlab_variable(mat_filename, var_name)
             variables_data[var_name] = data
         except Exception as e:
-            print(f"    ⚠ Warning: Could not read '{var_name}': {e}")
+            print(f"    [WARN] Could not read '{var_name}': {e}")
             variables_data[var_name] = None  # Mark as unreadable
     
     # Generate HTML
