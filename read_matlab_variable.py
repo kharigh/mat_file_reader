@@ -281,7 +281,7 @@ def read_matlab_variable(filename, var_name):
             # Try fallback: use direct ref_idx from timeseries metadata
             return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
         
-        time_idx = allocation[ts_varname]
+        time_idx, data_idx = allocation[ts_varname]
         time_ref = mcos_refs[time_idx]
         time_obj = f[time_ref]
         
@@ -301,26 +301,44 @@ def read_matlab_variable(filename, var_name):
             print(f"  [DEBUG] time_data is empty")
             return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
         
-        # Find corresponding DATA array (search forward from time array)
-        signal_data = None
         n_samples = time_data.shape[1] if len(time_data.shape) == 2 else time_data.shape[0]
         
-        for offset in range(1, 20):
-            idx = time_idx + offset
-            if idx >= len(mcos_refs) or not mcos_refs[idx]:
-                continue
-            
-            data_ref = mcos_refs[idx]
-            data_obj = f[data_ref]
-            
-            if not isinstance(data_obj, h5py.Dataset) or data_obj.dtype != np.float64:
-                continue
-            
-            # Data can have various shapes: (N, ...) or (1, N) or (N, 1, 1)
-            # Check if any dimension matches n_samples
-            if n_samples in data_obj.shape:
-                signal_data = data_obj[:]
-                break
+        # Get Data array - either from allocation or by searching
+        signal_data = None
+        
+        if data_idx is not None:
+            # Data index was determined during allocation (Time/Data pairs)
+            try:
+                data_ref = mcos_refs[data_idx]
+                data_obj = f[data_ref]
+                if isinstance(data_obj, h5py.Dataset) and np.issubdtype(data_obj.dtype, np.number):
+                    if n_samples in data_obj.shape or data_obj.size == n_samples:
+                        signal_data = data_obj[:]
+            except:
+                pass
+        
+        # If no data_idx or it failed, search for Data array
+        if signal_data is None:
+            for offset in range(1, 20):
+                idx = time_idx + offset
+                if idx >= len(mcos_refs) or not mcos_refs[idx]:
+                    continue
+                
+                try:
+                    data_ref = mcos_refs[idx]
+                    data_obj = f[data_ref]
+                    
+                    if not isinstance(data_obj, h5py.Dataset):
+                        continue
+                    
+                    if not np.issubdtype(data_obj.dtype, np.number):
+                        continue
+                    
+                    if n_samples in data_obj.shape or data_obj.size == n_samples:
+                        signal_data = data_obj[:]
+                        break
+                except:
+                    pass
         
         if signal_data is not None:
             return {
@@ -328,7 +346,7 @@ def read_matlab_variable(filename, var_name):
                 'Data': signal_data.squeeze()
             }
         
-        print(f"  [DEBUG] Could not find matching Data array for {n_samples} samples")
+        print(f"  [DEBUG] Could not find Data array for Time at idx={time_idx}")
         return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
     
     def _fallback_timeseries_extraction(f, ts_var, mcos_refs):
@@ -343,32 +361,49 @@ def read_matlab_variable(filename, var_name):
                 ref_idx = int(ts_data[0, 4])
                 print(f"  [DEBUG] Fallback: trying direct ref_idx = {ref_idx}")
                 
-                # Search around ref_idx for time-like arrays
-                for search_idx in range(max(1, ref_idx - 5), min(len(mcos_refs), ref_idx + 20)):
+                # Search around ref_idx for time-like arrays (float64, shape (1, N))
+                for search_idx in range(max(1, ref_idx - 10), min(len(mcos_refs), ref_idx + 30)):
                     if not mcos_refs[search_idx]:
                         continue
                     
                     try:
                         obj = f[mcos_refs[search_idx]]
-                        if isinstance(obj, h5py.Dataset) and obj.dtype == np.float64:
+                        if not isinstance(obj, h5py.Dataset):
+                            continue
+                        
+                        # Look for time-like array: float64, shape (1, N) or (N,) where N >= 2
+                        if obj.dtype == np.float64:
+                            n_samples = None
                             if len(obj.shape) == 2 and obj.shape[0] == 1 and obj.shape[1] >= 2:
+                                n_samples = obj.shape[1]
+                            elif len(obj.shape) == 1 and obj.shape[0] >= 2:
+                                n_samples = obj.shape[0]
+                            
+                            if n_samples is not None:
                                 time_data = obj[:]
-                                n_samples = time_data.shape[1]
                                 
-                                # Look for matching data array
-                                for data_offset in range(1, 10):
+                                # Data should be the NEXT array
+                                for data_offset in range(1, 5):
                                     data_idx = search_idx + data_offset
                                     if data_idx >= len(mcos_refs) or not mcos_refs[data_idx]:
                                         continue
                                     
-                                    data_obj = f[mcos_refs[data_idx]]
-                                    if isinstance(data_obj, h5py.Dataset) and data_obj.dtype == np.float64:
-                                        if n_samples in data_obj.shape:
-                                            print(f"  [DEBUG] Fallback succeeded at idx {search_idx}")
+                                    try:
+                                        data_obj = f[mcos_refs[data_idx]]
+                                        if not isinstance(data_obj, h5py.Dataset):
+                                            continue
+                                        
+                                        if not np.issubdtype(data_obj.dtype, np.number):
+                                            continue
+                                        
+                                        if n_samples in data_obj.shape or data_obj.size == n_samples:
+                                            print(f"  [DEBUG] Fallback succeeded at idx {search_idx}, data at {data_idx}")
                                             return {
                                                 'Time': time_data.flatten(),
                                                 'Data': data_obj[:].squeeze()
                                             }
+                                    except:
+                                        pass
                     except:
                         pass
         except Exception as e:
@@ -502,17 +537,24 @@ def read_matlab_variable(filename, var_name):
         # - If metadata says 2 columns BUT ratio ≈ 1 → Data has different shape, take all
         # - If metadata says 1 column → take all
         if expected_columns >= 2 and len(ts_sorted) > 0 and len(all_arrays) >= len(ts_sorted) * 1.5:
-            # Data has same shape as Time - take every other (first of each pair)
-            slot_indices = all_arrays[::2]
+            # Data has same shape as Time - arrays come as Time/Data pairs
+            # Even indices (0, 2, 4...) are Time, odd indices (1, 3, 5...) are Data
+            time_indices = all_arrays[::2]
+            data_indices = all_arrays[1::2]
         else:
-            # Data has different shape OR only Time column - all matching are Time arrays
-            slot_indices = all_arrays
+            # Data has different shape - all matching arrays are Time arrays
+            # Data will be searched separately
+            time_indices = all_arrays
+            data_indices = None
         
         # Step 4: Build allocation - position in sorted list = slot number
+        # Returns dict: name -> (time_idx, data_idx or None)
         allocation = {}
         for slot_num, (name, ref_idx) in enumerate(ts_sorted):
-            if slot_num < len(slot_indices):
-                allocation[name] = slot_indices[slot_num]
+            if slot_num < len(time_indices):
+                time_idx = time_indices[slot_num]
+                data_idx = data_indices[slot_num] if data_indices and slot_num < len(data_indices) else None
+                allocation[name] = (time_idx, data_idx)
         
         return allocation
     
