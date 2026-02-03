@@ -255,59 +255,133 @@ def read_matlab_variable(filename, var_name):
         """
         # Validate timeseries variable exists
         if ts_varname not in f:
+            print(f"  [DEBUG] Timeseries '{ts_varname}' not found in file")
             return None
         
         ts_var = f[ts_varname]
         if not isinstance(ts_var, h5py.Dataset):
+            print(f"  [DEBUG] Timeseries '{ts_varname}' is not a Dataset")
             return None
         
         # Get MCOS reference array
         if '#subsystem#' not in f or 'MCOS' not in f['#subsystem#']:
+            print(f"  [DEBUG] No MCOS subsystem found in file")
             return None
         
         mcos = f['#subsystem#']['MCOS']
+        mcos_refs = mcos[0][:]  # Read entire row into memory to avoid repeated HDF5 access
         
         # ALWAYS use allocation algorithm (ref_idx does NOT directly map to slots)
-        allocation = _build_timeseries_allocation(f, mcos)
+        allocation = _build_timeseries_allocation(f, mcos_refs)
         
         # Look up this timeseries in the allocation table
-        if ts_varname in allocation:
-            time_idx = allocation[ts_varname]
-            time_ref = mcos[0][time_idx]
-            time_obj = f[time_ref]
-            time_data = time_obj[:]
+        if ts_varname not in allocation:
+            print(f"  [DEBUG] Timeseries '{ts_varname}' not in allocation table")
+            print(f"  [DEBUG] Available in allocation: {list(allocation.keys())}")
+            # Try fallback: use direct ref_idx from timeseries metadata
+            return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
+        
+        time_idx = allocation[ts_varname]
+        time_ref = mcos_refs[time_idx]
+        time_obj = f[time_ref]
+        
+        # Validate this is actually time data (float64, reasonable shape)
+        if not isinstance(time_obj, h5py.Dataset):
+            print(f"  [DEBUG] time_obj at index {time_idx} is not a Dataset")
+            return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
+        
+        if time_obj.dtype != np.float64:
+            print(f"  [DEBUG] time_obj dtype is {time_obj.dtype}, expected float64")
+            return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
+        
+        time_data = time_obj[:]
+        
+        # Sanity check: time data should be numeric and have reasonable values
+        if time_data.size == 0:
+            print(f"  [DEBUG] time_data is empty")
+            return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
+        
+        # Find corresponding DATA array (search forward from time array)
+        signal_data = None
+        n_samples = time_data.shape[1] if len(time_data.shape) == 2 else time_data.shape[0]
+        
+        for offset in range(1, 20):
+            idx = time_idx + offset
+            if idx >= len(mcos_refs) or not mcos_refs[idx]:
+                continue
             
-            # Find corresponding DATA array (search forward from time array)
-            signal_data = None
-            n_samples = time_data.shape[1]  # Time is (1, N)
+            data_ref = mcos_refs[idx]
+            data_obj = f[data_ref]
             
-            for offset in range(1, 20):
-                idx = time_idx + offset
-                if idx >= len(mcos[0]) or not mcos[0][idx]:
-                    continue
-                
-                data_ref = mcos[0][idx]
-                data_obj = f[data_ref]
-                
-                if not isinstance(data_obj, h5py.Dataset) or data_obj.dtype != np.float64:
-                    continue
-                
-                # Data can have various shapes: (N, ...) or (1, N) or (N, 1, 1)
-                # Check if any dimension matches n_samples
-                if n_samples in data_obj.shape:
-                    signal_data = data_obj[:]
-                    break
+            if not isinstance(data_obj, h5py.Dataset) or data_obj.dtype != np.float64:
+                continue
             
-            if signal_data is not None:
-                return {
-                    'Time': time_data.flatten(),
-                    'Data': signal_data.squeeze()
-                }
+            # Data can have various shapes: (N, ...) or (1, N) or (N, 1, 1)
+            # Check if any dimension matches n_samples
+            if n_samples in data_obj.shape:
+                signal_data = data_obj[:]
+                break
+        
+        if signal_data is not None:
+            return {
+                'Time': time_data.flatten(),
+                'Data': signal_data.squeeze()
+            }
+        
+        print(f"  [DEBUG] Could not find matching Data array for {n_samples} samples")
+        return _fallback_timeseries_extraction(f, ts_var, mcos_refs)
+    
+    def _fallback_timeseries_extraction(f, ts_var, mcos_refs):
+        """Fallback method: try to extract timeseries using direct ref_idx.
+        
+        This is used when the allocation algorithm fails.
+        """
+        try:
+            # Get ref_idx directly from timeseries metadata (position [0,4])
+            ts_data = ts_var[:]
+            if ts_data.shape[1] >= 5:
+                ref_idx = int(ts_data[0, 4])
+                print(f"  [DEBUG] Fallback: trying direct ref_idx = {ref_idx}")
+                
+                # Search around ref_idx for time-like arrays
+                for search_idx in range(max(1, ref_idx - 5), min(len(mcos_refs), ref_idx + 20)):
+                    if not mcos_refs[search_idx]:
+                        continue
+                    
+                    try:
+                        obj = f[mcos_refs[search_idx]]
+                        if isinstance(obj, h5py.Dataset) and obj.dtype == np.float64:
+                            if len(obj.shape) == 2 and obj.shape[0] == 1 and obj.shape[1] >= 2:
+                                time_data = obj[:]
+                                n_samples = time_data.shape[1]
+                                
+                                # Look for matching data array
+                                for data_offset in range(1, 10):
+                                    data_idx = search_idx + data_offset
+                                    if data_idx >= len(mcos_refs) or not mcos_refs[data_idx]:
+                                        continue
+                                    
+                                    data_obj = f[mcos_refs[data_idx]]
+                                    if isinstance(data_obj, h5py.Dataset) and data_obj.dtype == np.float64:
+                                        if n_samples in data_obj.shape:
+                                            print(f"  [DEBUG] Fallback succeeded at idx {search_idx}")
+                                            return {
+                                                'Time': time_data.flatten(),
+                                                'Data': data_obj[:].squeeze()
+                                            }
+                    except:
+                        pass
+        except Exception as e:
+            print(f"  [DEBUG] Fallback failed: {e}")
         
         return None
     
-    def _get_timeseries_structure_from_metadata(f, mcos):
+    def _get_timeseries_structure_from_metadata(f, mcos_refs):
         """Parse MCOS metadata blob to determine timeseries structure.
+        
+        Args:
+            f: HDF5 file handle
+            mcos_refs: numpy array of MCOS references (already read from mcos[0][:])
         
         Returns dict with:
           - has_time: bool (Time_ property exists)
@@ -315,7 +389,7 @@ def read_matlab_variable(filename, var_name):
           - columns_per_ts: int (expected float64 arrays per timeseries)
         """
         try:
-            meta_blob = f[mcos[0][0]][:].flatten()
+            meta_blob = f[mcos_refs[0]][:].flatten()
             
             # Extract property names ending with underscore (data storage properties)
             props = set()
@@ -344,8 +418,12 @@ def read_matlab_variable(filename, var_name):
             # Default assumption if metadata parsing fails
             return {'has_time': True, 'has_data': True, 'columns_per_ts': 2}
     
-    def _build_timeseries_allocation(f, mcos):
+    def _build_timeseries_allocation(f, mcos_refs):
         """Build allocation table mapping timeseries names to MCOS time array indices.
+        
+        Args:
+            f: HDF5 file handle
+            mcos_refs: numpy array of MCOS references (already read from mcos[0][:])
         
         MATLAB v7.3 timeseries mapping - CORRECTED ALGORITHM:
         
@@ -359,34 +437,37 @@ def read_matlab_variable(filename, var_name):
         (alphabetical), and stores time data in the same order.
         """
         # Step 0: Validate metadata structure
-        ts_structure = _get_timeseries_structure_from_metadata(f, mcos)
+        ts_structure = _get_timeseries_structure_from_metadata(f, mcos_refs)
         if not ts_structure['has_time']:
             # No Time_ property - unusual timeseries format
             return {}
         
         expected_columns = ts_structure['columns_per_ts']
-        # Step 1: Find all timeseries in file with their ref_idx
+        # Step 1: Find all timeseries in file with their ref_idx (recursively)
         ts_list = []  # (name, ref_idx)
         
-        for key in f.keys():
-            if key.startswith('#'):
-                continue
-            
-            item = f[key]
-            if isinstance(item, h5py.Dataset):
-                attrs = dict(item.attrs)
-                if attrs.get('MATLAB_class') == b'timeseries':
-                    ref_idx = int(item[0, 4])
-                    ts_list.append((key, ref_idx))
-            
-            elif isinstance(item, h5py.Group):
-                for subkey in item.keys():
-                    subitem = item[subkey]
-                    if isinstance(subitem, h5py.Dataset):
-                        subattrs = dict(subitem.attrs)
-                        if subattrs.get('MATLAB_class') == b'timeseries':
-                            ref_idx = int(subitem[0, 4])
-                            ts_list.append((f"{key}/{subkey}", ref_idx))
+        def find_timeseries_recursive(group, path_prefix=""):
+            """Recursively find all timeseries in groups"""
+            for key in group.keys():
+                if key.startswith('#'):
+                    continue
+                
+                item = group[key]
+                item_path = f"{path_prefix}/{key}" if path_prefix else key
+                
+                if isinstance(item, h5py.Dataset):
+                    attrs = dict(item.attrs)
+                    if attrs.get('MATLAB_class') == b'timeseries':
+                        try:
+                            ref_idx = int(item[0, 4])
+                            ts_list.append((item_path, ref_idx))
+                        except:
+                            pass
+                
+                elif isinstance(item, h5py.Group):
+                    find_timeseries_recursive(item, item_path)
+        
+        find_timeseries_recursive(f)
         
         # Step 2: Sort by ref_idx
         ts_sorted = sorted(ts_list, key=lambda x: x[1])
@@ -394,15 +475,20 @@ def read_matlab_variable(filename, var_name):
         # Step 3: Find all TIME array MCOS indices (slot_indices) in order
         # MATLAB stores Time/Data pairs: first is Time, second is Data
         # Find all float64 arrays with shape (1, N) where N >= 2, then take every other one
+        # NOTE: Skip index 0 which is the MCOS metadata blob, not actual data
         all_arrays = []
-        for i in range(len(mcos[0])):
-            if not mcos[0][i]:
+        for i in range(1, len(mcos_refs)):  # Start from 1 to skip metadata blob
+            if not mcos_refs[i]:
                 continue
             
             try:
-                obj = f[mcos[0][i]]
+                obj = f[mcos_refs[i]]
                 attrs = dict(obj.attrs)
                 is_empty = attrs.get('MATLAB_empty', 0)
+                
+                # Additional check: skip if this looks like metadata (uint8 dtype is common for metadata)
+                if obj.dtype == np.uint8:
+                    continue
                 
                 if not is_empty and isinstance(obj, h5py.Dataset) and obj.dtype == np.float64:
                     if len(obj.shape) == 2 and obj.shape[0] == 1 and obj.shape[1] >= 2:
@@ -458,10 +544,10 @@ def read_matlab_variable(filename, var_name):
         if matlab_class == 'timeseries':
             result = process_timeseries(f, var_name)
             if result is not None:
-                print(f"  ✓ Timeseries with {len(result['Data'])} samples")
+                print(f"  [OK] Timeseries with {len(result['Data'])} samples")
                 return result
             else:
-                print(f"  ⚠ Could not decode timeseries, returning raw data")
+                print(f"  [WARN] Could not decode timeseries, returning raw data")
                 return var[:]
         
         elif isinstance(var, h5py.Group):
@@ -471,11 +557,11 @@ def read_matlab_variable(filename, var_name):
         elif isinstance(var, h5py.Dataset):
             result = process_dataset(var)
             if isinstance(result, np.ndarray):
-                print(f"  ✓ Loaded successfully (returned shape: {result.shape})")
+                print(f"  [OK] Loaded successfully (returned shape: {result.shape})")
             else:
-                print(f"  ✓ Loaded successfully")
+                print(f"  [OK] Loaded successfully")
             return result
         
         else:
-            print(f"  ⚠ Unknown type, returning raw data")
+            print(f"  [WARN] Unknown type, returning raw data")
             return var[:]
