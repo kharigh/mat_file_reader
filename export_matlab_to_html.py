@@ -333,6 +333,10 @@ def generate_timeseries_html(var_name, ts_data, max_rows):
     if not isinstance(data_arr, np.ndarray):
         data_arr = np.array(data_arr)
     
+    # Flatten arrays if they are 2D (common for MATLAB data)
+    time_arr = time_arr.flatten()
+    data_arr = data_arr.flatten()
+    
     total_rows = len(time_arr)
     show_all = total_rows <= max_rows
     display_rows = total_rows if show_all else max_rows
